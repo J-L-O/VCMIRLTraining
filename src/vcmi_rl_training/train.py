@@ -117,14 +117,21 @@ def collect_rollout(
     model: BattleTransformer,
     buffer: RolloutBuffer,
     device: torch.device,
+    obs: dict[str, np.ndarray],
     step_bar=None,
     epsilon: float = 0.0,
-) -> dict:
-    """Collect one rollout of experience from vectorized environments."""
+) -> tuple[dict, dict[str, np.ndarray]]:
+    """Collect one rollout of experience, continuing from the given obs.
+
+    Returns (stats_dict, last_obs) so the caller can carry obs across rollouts.
+    """
     num_envs = envs.num_envs
-    obs, info = envs.reset()
     episode_rewards = np.zeros(num_envs)
+    episode_enemy_killed = np.zeros(num_envs)
+    episode_own_lost = np.zeros(num_envs)
     completed_episodes = []
+    completed_enemy_killed = []
+    completed_own_lost = []
     illegal_count = 0
     total_steps = 0
 
@@ -159,38 +166,56 @@ def collect_rollout(
         # Track episode stats
         episode_rewards += rewards
         total_steps += num_envs
+
+        enemy_killed_arr = infos.get("enemy_killed_value", np.zeros(num_envs))
+        own_lost_arr = infos.get("own_lost_value", np.zeros(num_envs))
+        if isinstance(enemy_killed_arr, np.ndarray):
+            episode_enemy_killed += enemy_killed_arr
+        if isinstance(own_lost_arr, np.ndarray):
+            episode_own_lost += own_lost_arr
+
         for i in range(num_envs):
             if infos.get("illegal_action", np.zeros(num_envs, dtype=bool))[i] if isinstance(infos.get("illegal_action"), np.ndarray) else False:
                 illegal_count += 1
             if dones[i]:
                 completed_episodes.append(episode_rewards[i])
+                completed_enemy_killed.append(episode_enemy_killed[i])
+                completed_own_lost.append(episode_own_lost[i])
                 episode_rewards[i] = 0.0
+                episode_enemy_killed[i] = 0.0
+                episode_own_lost[i] = 0.0
 
-        buffer.store(obs, actions_np, log_probs_np, values_np, rewards, dones.astype(np.float32))
+        # Record which side acted (from the obs BEFORE the action)
+        acting_sides = obs["scalars"][:, _SC_ACTIVE_SIDE].astype(np.int32)
+        buffer.store(obs, actions_np, log_probs_np, values_np, rewards, dones.astype(np.float32), acting_sides)
         obs = next_obs
 
         if step_bar is not None:
             step_bar.update(1)
             step_bar.set_postfix(ep=len(completed_episodes), illegal=f"{illegal_count}/{total_steps}")
 
-    # Bootstrap value for GAE
+    # Bootstrap value for GAE (per-side)
     with torch.no_grad():
         obs_t = obs_to_tensors(obs, device)
         _, _, _, last_values = model.get_action_and_value(obs_t)
         last_values_np = last_values.cpu().numpy()
 
     last_dones = dones.astype(np.float32)
-    buffer.compute_gae(last_values_np, last_dones)
+    last_sides = obs["scalars"][:, _SC_ACTIVE_SIDE].astype(np.int32)
+    buffer.compute_gae(last_values_np, last_dones, last_sides)
 
-    return {
+    stats = {
         "total_steps": total_steps,
         "completed_episodes": len(completed_episodes),
         "mean_reward": float(np.mean(completed_episodes)) if completed_episodes else 0.0,
         "min_reward": float(np.min(completed_episodes)) if completed_episodes else 0.0,
         "max_reward": float(np.max(completed_episodes)) if completed_episodes else 0.0,
+        "mean_enemy_killed": float(np.mean(completed_enemy_killed)) if completed_enemy_killed else 0.0,
+        "mean_own_lost": float(np.mean(completed_own_lost)) if completed_own_lost else 0.0,
         "illegal_actions": illegal_count,
         "illegal_rate": illegal_count / total_steps if total_steps > 0 else 0.0,
     }
+    return stats, obs
 
 
 def run_playtest(
@@ -253,6 +278,7 @@ def main():
     parser.add_argument("--vcmi-cwd", default=None, help="Working directory for game process")
     parser.add_argument("--port", type=int, default=10000, help="Base port for game connections")
     parser.add_argument("--num-envs", type=int, default=4, help="Number of parallel environments")
+    parser.add_argument("--max-steps", type=int, default=500, help="Truncate episodes after N steps (0 = no limit)")
 
     # Model
     parser.add_argument("--d-model", type=int, default=128, help="Transformer model dimension")
@@ -280,6 +306,7 @@ def main():
     parser.add_argument("--save-dir", default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--save-interval", type=int, default=50, help="Save checkpoint every N iterations")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-entity", default=None, help="W&B entity name")
     parser.add_argument("--wandb-project", default="vcmi-rl", help="W&B project name")
     parser.add_argument("--wandb-name", default=None, help="W&B run name")
 
@@ -290,6 +317,8 @@ def main():
                         help="Play against the AI in a graphical game")
     parser.add_argument("--progress", action="store_true",
                         help="Show tqdm progress bars during training")
+    parser.add_argument("--fp8", action="store_true",
+                        help="Enable FP8 mixed precision training (requires Ada/Hopper GPU)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -321,6 +350,28 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model created: {n_params:,} parameters")
 
+    if args.fp8:
+        from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+        import torch.nn as nn
+
+        def _fp8_module_filter(module: nn.Module, fqn: str) -> bool:
+            """Only convert nn.Linear layers whose dimensions are both divisible by 16."""
+            if not isinstance(module, nn.Linear):
+                return False
+            return module.in_features % 16 == 0 and module.out_features % 16 == 0
+
+        config = Float8LinearConfig(pad_inner_dim=True)
+        convert_to_float8_training(model, config=config, module_filter_fn=_fp8_module_filter)
+        converted = sum(
+            1 for _, m in model.named_modules()
+            if type(m).__name__ == "Float8Linear"
+        )
+        total_linear = sum(
+            1 for _, m in model.named_modules()
+            if isinstance(m, (nn.Linear,)) or type(m).__name__ == "Float8Linear"
+        )
+        logger.info(f"FP8 training enabled: {converted}/{total_linear} linear layers converted")
+
     # ---- Playtest mode ----
     if args.playtest:
         model.eval()
@@ -341,6 +392,7 @@ def main():
         try:
             import wandb
             wandb_run = wandb.init(
+                entity=args.wandb_entity,
                 project=args.wandb_project,
                 name=args.wandb_name,
                 config=vars(args),
@@ -360,6 +412,7 @@ def main():
             test_map=args.test_map,
             port_base=args.port,
             vcmi_cwd=args.vcmi_cwd,
+            max_steps=args.max_steps,
         )
         for i in range(args.num_envs)
     ])
@@ -395,6 +448,7 @@ def main():
             logger.warning("tqdm not installed, disabling progress bars")
 
     global_step = 0
+    obs, _ = envs.reset()
     try:
         iter_range = range(1, args.iterations + 1)
         if tqdm_cls is not None:
@@ -417,8 +471,9 @@ def main():
                     total=args.num_steps, desc="  Rollout", unit="step",
                     leave=False,
                 )
-            rollout_stats = collect_rollout(
-                envs, model, buffer, device, step_bar=step_bar, epsilon=epsilon,
+            rollout_stats, obs = collect_rollout(
+                envs, model, buffer, device, obs,
+                step_bar=step_bar, epsilon=epsilon,
             )
             if step_bar is not None:
                 step_bar.close()
@@ -446,6 +501,8 @@ def main():
                 f"episodes={rollout_stats['completed_episodes']}, "
                 f"reward={rollout_stats['mean_reward']:.3f} "
                 f"[{rollout_stats['min_reward']:.1f}, {rollout_stats['max_reward']:.1f}], "
+                f"killed={rollout_stats['mean_enemy_killed']:.3f}, "
+                f"lost={rollout_stats['mean_own_lost']:.3f}, "
                 f"illegal={rollout_stats['illegal_rate']:.1%}, "
                 f"pg_loss={ppo_metrics['policy_loss']:.4f}, "
                 f"v_loss={ppo_metrics['value_loss']:.4f}, "
@@ -463,6 +520,8 @@ def main():
                     "rollout/min_reward": rollout_stats["min_reward"],
                     "rollout/max_reward": rollout_stats["max_reward"],
                     "rollout/illegal_rate": rollout_stats["illegal_rate"],
+                    "rollout/mean_enemy_killed": rollout_stats["mean_enemy_killed"],
+                    "rollout/mean_own_lost": rollout_stats["mean_own_lost"],
                     "rollout/illegal_actions": rollout_stats["illegal_actions"],
                     "ppo/policy_loss": ppo_metrics["policy_loss"],
                     "ppo/value_loss": ppo_metrics["value_loss"],

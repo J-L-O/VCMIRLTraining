@@ -45,11 +45,14 @@ class RolloutBuffer:
         self.rewards = np.zeros((num_steps, num_envs), dtype=np.float32)
         self.dones = np.zeros((num_steps, num_envs), dtype=np.float32)
 
+        # Per-step side tracking (for self-play per-side GAE)
+        self.sides = np.zeros((num_steps, num_envs), dtype=np.int32)
+
         # Computed after rollout
         self.advantages = np.zeros((num_steps, num_envs), dtype=np.float32)
         self.returns = np.zeros((num_steps, num_envs), dtype=np.float32)
 
-    def store(self, obs: dict, actions, log_probs, values, rewards, dones):
+    def store(self, obs: dict, actions, log_probs, values, rewards, dones, sides):
         """Store one step of rollout data."""
         t = self.pos
         self.obs_scalars[t] = obs["scalars"]
@@ -63,27 +66,64 @@ class RolloutBuffer:
         self.values[t] = values
         self.rewards[t] = rewards
         self.dones[t] = dones
+        self.sides[t] = sides
         self.pos += 1
 
     def compute_gae(self, last_value: np.ndarray, last_done: np.ndarray,
+                    last_sides: np.ndarray,
                     gamma: float = 0.99, gae_lambda: float = 0.95):
-        """Compute GAE advantages and discounted returns."""
-        last_gae = 0.0
-        for t in reversed(range(self.num_steps)):
-            if t == self.num_steps - 1:
-                next_non_terminal = 1.0 - last_done
-                next_values = last_value
-            else:
-                next_non_terminal = 1.0 - self.dones[t + 1]
-                next_values = self.values[t + 1]
-            delta = (
-                self.rewards[t]
-                + gamma * next_values * next_non_terminal
-                - self.values[t]
-            )
-            self.advantages[t] = last_gae = (
-                delta + gamma * gae_lambda * next_non_terminal * last_gae
-            )
+        """Compute GAE advantages and discounted returns per side.
+
+        In self-play, each side's steps form a separate episode for GAE
+        purposes.  We only chain value bootstraps between consecutive
+        steps of the *same* side, cutting whenever any done occurs in
+        the intervening steps (battle ended during the other side's turn).
+        """
+        self.advantages[:] = 0.0
+        N = self.num_steps
+
+        for env in range(self.num_envs):
+            for side in (0, 1):
+                # Indices of steps where this side acted
+                side_steps = np.where(self.sides[:N, env] == side)[0]
+                if len(side_steps) == 0:
+                    continue
+
+                last_gae = 0.0
+                for i in reversed(range(len(side_steps))):
+                    t = side_steps[i]
+
+                    if i == len(side_steps) - 1:
+                        # Last same-side step in rollout — check for dones
+                        # between here and rollout end
+                        if self.dones[t:N, env].any():
+                            next_non_terminal = 0.0
+                            next_value = 0.0
+                        elif last_sides[env] == side:
+                            next_non_terminal = 1.0 - last_done[env]
+                            next_value = last_value[env]
+                        else:
+                            # Last obs belongs to other side; can't bootstrap
+                            next_non_terminal = 0.0
+                            next_value = 0.0
+                    else:
+                        next_t = side_steps[i + 1]
+                        # Check for any done between t (inclusive) and next_t
+                        if self.dones[t:next_t, env].any():
+                            next_non_terminal = 0.0
+                            next_value = 0.0
+                        else:
+                            next_non_terminal = 1.0
+                            next_value = self.values[next_t, env]
+
+                    delta = (
+                        self.rewards[t, env]
+                        + gamma * next_value * next_non_terminal
+                        - self.values[t, env]
+                    )
+                    last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
+                    self.advantages[t, env] = last_gae
+
         self.returns = self.advantages + self.values
 
     def get_batches(self, batch_size: int):
