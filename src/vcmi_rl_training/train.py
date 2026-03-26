@@ -112,97 +112,226 @@ def sample_random_valid_action(obs: dict[str, np.ndarray], env_idx: int) -> np.n
     return np.array(choice, dtype=np.int64)
 
 
+def _compute_and_dispatch(
+    env_group: gym.vector.VectorEnv,
+    obs_g: dict[str, np.ndarray],
+    model: BattleTransformer,
+    device: torch.device,
+    epsilon: float,
+    amp_dtype: torch.dtype | None = None,
+) -> dict:
+    """GPU inference + async env dispatch for one microbatch.
+
+    Returns a dict with the pre-step data needed for buffer storage.
+    """
+    n_g = env_group.num_envs
+    obs_t = obs_to_tensors(obs_g, device)
+
+    action_mask = {
+        "action_type": torch.from_numpy(obs_g["action_type_mask"]).to(device),
+        "hex": torch.from_numpy(obs_g["hex_mask"]).to(device),
+        "target": torch.from_numpy(obs_g["target_mask"]).to(device),
+    }
+
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+        actions, log_probs, _, values = model.get_action_and_value(obs_t, action_mask=action_mask)
+
+    actions_np = actions.cpu().numpy()
+    values_np = values.float().cpu().numpy()
+
+    if epsilon > 0:
+        explore_mask = np.random.random(n_g) < epsilon
+        for i in range(n_g):
+            if explore_mask[i]:
+                actions_np[i] = sample_random_valid_action(obs_g, i)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+            actions_t = torch.from_numpy(actions_np).long().to(device)
+            _, log_probs, _, _ = model.get_action_and_value(obs_t, action=actions_t, action_mask=action_mask)
+
+    log_probs_np = log_probs.float().cpu().numpy()
+    sides = obs_g["scalars"][:, _SC_ACTIVE_SIDE].astype(np.int32)
+
+    # Non-blocking: env subprocesses start stepping immediately
+    env_group.step_async(actions_np)
+
+    return {
+        "obs": obs_g,
+        "actions": actions_np,
+        "log_probs": log_probs_np,
+        "values": values_np,
+        "sides": sides,
+    }
+
+
+def _store_group_step(buffer: RolloutBuffer, step: int, env_offset: int,
+                      data: dict, rewards, dones_f32):
+    """Write one microbatch's data into the buffer at [step, env_slice]."""
+    n = len(rewards)
+    sl = slice(env_offset, env_offset + n)
+    buffer.obs_scalars[step, sl] = data["obs"]["scalars"]
+    buffer.obs_stacks[step, sl] = data["obs"]["stacks"]
+    buffer.obs_obstacles[step, sl] = data["obs"]["obstacles"]
+    buffer.obs_reachable[step, sl] = data["obs"]["reachable_hexes"]
+    buffer.obs_n_stacks[step, sl] = data["obs"]["n_stacks"]
+    buffer.obs_attack_targets[step, sl] = data["obs"]["attack_targets"]
+    buffer.mask_action_type[step, sl] = data["obs"]["action_type_mask"]
+    buffer.mask_hex[step, sl] = data["obs"]["hex_mask"]
+    buffer.mask_target[step, sl] = data["obs"]["target_mask"]
+    buffer.actions[step, sl] = data["actions"]
+    buffer.log_probs[step, sl] = data["log_probs"]
+    buffer.values[step, sl] = data["values"]
+    buffer.rewards[step, sl] = rewards
+    buffer.dones[step, sl] = dones_f32
+    buffer.sides[step, sl] = data["sides"]
+
+
 def collect_rollout(
-    envs: gym.vector.VectorEnv,
+    env_groups: list[gym.vector.VectorEnv],
     model: BattleTransformer,
     buffer: RolloutBuffer,
     device: torch.device,
-    obs: dict[str, np.ndarray],
+    obs_groups: list[dict[str, np.ndarray]],
     step_bar=None,
     epsilon: float = 0.0,
-) -> tuple[dict, dict[str, np.ndarray]]:
-    """Collect one rollout of experience, continuing from the given obs.
+    amp_dtype: torch.dtype | None = None,
+) -> tuple[dict, list[dict[str, np.ndarray]]]:
+    """Collect one rollout with cross-step microbatch pipelining.
 
-    Returns (stats_dict, last_obs) so the caller can carry obs across rollouts.
+    Environments are split into *env_groups* (microbatches).  Each group
+    advances through rollout steps independently: after collecting a
+    group's result the GPU immediately computes and dispatches the next
+    step for that group, even if other groups haven't finished their
+    current step yet.  This overlaps GPU inference for one group with
+    environment wall-clock time of the others.
+
+    Returns (stats_dict, obs_groups) so the caller can carry obs across
+    rollouts.
     """
-    num_envs = envs.num_envs
+    M = len(env_groups)
+    num_envs = sum(g.num_envs for g in env_groups)
+    S = buffer.num_steps
+
     episode_rewards = np.zeros(num_envs)
     episode_enemy_killed = np.zeros(num_envs)
     episode_own_lost = np.zeros(num_envs)
     completed_episodes = []
     completed_enemy_killed = []
     completed_own_lost = []
-    illegal_count = 0
     total_steps = 0
 
     buffer.reset()
 
-    for step in range(buffer.num_steps):
-        obs_t = obs_to_tensors(obs, device)
+    # Precompute env-index offsets for each microbatch
+    env_offsets = []
+    offset = 0
+    for g in range(M):
+        env_offsets.append(offset)
+        offset += env_groups[g].num_envs
 
-        with torch.no_grad():
-            actions, log_probs, entropy, values = model.get_action_and_value(obs_t)
+    # Per-group pipeline state
+    group_step = [0] * M          # next step index to fill for each group
+    pending_data: list[dict | None] = [None] * M
 
-        actions_np = actions.cpu().numpy()
-        values_np = values.cpu().numpy()
+    # Warm up: compute and dispatch step 0 for all groups.
+    # Earlier groups start stepping while later ones are still computed.
+    for g in range(M):
+        pending_data[g] = _compute_and_dispatch(
+            env_groups[g], obs_groups[g], model, device, epsilon,
+            amp_dtype=amp_dtype,
+        )
 
-        # Epsilon-greedy: replace some actions with random valid ones
-        if epsilon > 0:
-            explore_mask = np.random.random(num_envs) < epsilon
-            for i in range(num_envs):
-                if explore_mask[i]:
-                    actions_np[i] = sample_random_valid_action(obs, i)
+    # Progress tracking
+    last_bar_step = 0
 
-            # Recompute log_probs for the (possibly replaced) actions
-            with torch.no_grad():
-                actions_t = torch.from_numpy(actions_np).long().to(device)
-                _, log_probs, _, _ = model.get_action_and_value(obs_t, action=actions_t)
+    # Pipeline: round-robin wait → store → compute next → dispatch
+    while True:
+        any_active = False
+        for g in range(M):
+            if group_step[g] >= S:
+                continue
+            any_active = True
 
-        log_probs_np = log_probs.cpu().numpy()
+            # Wait for this group's pending env step
+            n_g = env_groups[g].num_envs
+            next_obs, rewards, terminated, truncated, infos = (
+                env_groups[g].step_wait()
+            )
+            dones = terminated | truncated
+            dones_f32 = dones.astype(np.float32)
 
-        next_obs, rewards, terminated, truncated, infos = envs.step(actions_np)
-        dones = terminated | truncated
+            # Store into buffer at this group's current step / env slice
+            _store_group_step(
+                buffer, group_step[g], env_offsets[g],
+                pending_data[g], rewards, dones_f32,
+            )
 
-        # Track episode stats
-        episode_rewards += rewards
-        total_steps += num_envs
+            # Update obs and advance step
+            obs_groups[g] = next_obs
+            group_step[g] += 1
+            total_steps += n_g
 
-        enemy_killed_arr = infos.get("enemy_killed_value", np.zeros(num_envs))
-        own_lost_arr = infos.get("own_lost_value", np.zeros(num_envs))
-        if isinstance(enemy_killed_arr, np.ndarray):
-            episode_enemy_killed += enemy_killed_arr
-        if isinstance(own_lost_arr, np.ndarray):
-            episode_own_lost += own_lost_arr
+            # Immediately compute & dispatch the *next* step for this
+            # group so its envs start working while we process other
+            # groups (or while the PPO update runs after the loop).
+            if group_step[g] < S:
+                pending_data[g] = _compute_and_dispatch(
+                    env_groups[g], obs_groups[g], model, device, epsilon,
+                )
 
-        for i in range(num_envs):
-            if infos.get("illegal_action", np.zeros(num_envs, dtype=bool))[i] if isinstance(infos.get("illegal_action"), np.ndarray) else False:
-                illegal_count += 1
-            if dones[i]:
-                completed_episodes.append(episode_rewards[i])
-                completed_enemy_killed.append(episode_enemy_killed[i])
-                completed_own_lost.append(episode_own_lost[i])
-                episode_rewards[i] = 0.0
-                episode_enemy_killed[i] = 0.0
-                episode_own_lost[i] = 0.0
+            # ---- Episode stats for this group's envs ----
+            sl = slice(env_offsets[g], env_offsets[g] + n_g)
+            episode_rewards[sl] += rewards
 
-        # Record which side acted (from the obs BEFORE the action)
-        acting_sides = obs["scalars"][:, _SC_ACTIVE_SIDE].astype(np.int32)
-        buffer.store(obs, actions_np, log_probs_np, values_np, rewards, dones.astype(np.float32), acting_sides)
-        obs = next_obs
+            enemy_killed_arr = infos.get("enemy_killed_value", np.zeros(n_g))
+            own_lost_arr = infos.get("own_lost_value", np.zeros(n_g))
+            if isinstance(enemy_killed_arr, np.ndarray):
+                episode_enemy_killed[sl] += enemy_killed_arr
+            if isinstance(own_lost_arr, np.ndarray):
+                episode_own_lost[sl] += own_lost_arr
 
-        if step_bar is not None:
-            step_bar.update(1)
-            step_bar.set_postfix(ep=len(completed_episodes), illegal=f"{illegal_count}/{total_steps}")
+            for i in range(n_g):
+                if dones[i]:
+                    gi = env_offsets[g] + i
+                    completed_episodes.append(episode_rewards[gi])
+                    completed_enemy_killed.append(episode_enemy_killed[gi])
+                    completed_own_lost.append(episode_own_lost[gi])
+                    episode_rewards[gi] = 0.0
+                    episode_enemy_killed[gi] = 0.0
+                    episode_own_lost[gi] = 0.0
+
+            # Update progress bar when the slowest group advances
+            if step_bar is not None:
+                min_step = min(group_step)
+                if min_step > last_bar_step:
+                    step_bar.update(min_step - last_bar_step)
+                    last_bar_step = min_step
+                    step_bar.set_postfix(
+                        ep=len(completed_episodes),
+                    )
+
+        if not any_active:
+            break
+
+    # Flush progress bar
+    if step_bar is not None and last_bar_step < S:
+        step_bar.update(S - last_bar_step)
+        step_bar.set_postfix(
+            ep=len(completed_episodes),
+        )
 
     # Bootstrap value for GAE (per-side)
-    with torch.no_grad():
-        obs_t = obs_to_tensors(obs, device)
+    last_obs = {
+        k: np.concatenate([obs_groups[g][k] for g in range(M)])
+        for k in obs_groups[0]
+    }
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+        obs_t = obs_to_tensors(last_obs, device)
         _, _, _, last_values = model.get_action_and_value(obs_t)
-        last_values_np = last_values.cpu().numpy()
+        last_values_np = last_values.float().cpu().numpy()
 
-    last_dones = dones.astype(np.float32)
-    last_sides = obs["scalars"][:, _SC_ACTIVE_SIDE].astype(np.int32)
-    buffer.compute_gae(last_values_np, last_dones, last_sides)
+    last_all_dones = buffer.dones[S - 1]
+    last_sides = last_obs["scalars"][:, _SC_ACTIVE_SIDE].astype(np.int32)
+    buffer.compute_gae(last_values_np, last_all_dones, last_sides)
 
     stats = {
         "total_steps": total_steps,
@@ -212,10 +341,8 @@ def collect_rollout(
         "max_reward": float(np.max(completed_episodes)) if completed_episodes else 0.0,
         "mean_enemy_killed": float(np.mean(completed_enemy_killed)) if completed_enemy_killed else 0.0,
         "mean_own_lost": float(np.mean(completed_own_lost)) if completed_own_lost else 0.0,
-        "illegal_actions": illegal_count,
-        "illegal_rate": illegal_count / total_steps if total_steps > 0 else 0.0,
     }
-    return stats, obs
+    return stats, obs_groups
 
 
 def run_playtest(
@@ -237,9 +364,14 @@ def run_playtest(
     try:
         while True:
             obs_t = obs_to_tensors_single(obs, device)
+            action_mask = {
+                "action_type": torch.from_numpy(obs["action_type_mask"]).unsqueeze(0).to(device),
+                "hex": torch.from_numpy(obs["hex_mask"]).unsqueeze(0).to(device),
+                "target": torch.from_numpy(obs["target_mask"]).unsqueeze(0).to(device),
+            }
 
             with torch.no_grad():
-                action, log_prob, entropy, value = model.get_action_and_value(obs_t)
+                action, log_prob, entropy, value = model.get_action_and_value(obs_t, action_mask=action_mask)
 
             action_np = action[0].cpu().numpy()
             obs, reward, terminated, truncated, info = env.step(action_np)
@@ -278,6 +410,8 @@ def main():
     parser.add_argument("--vcmi-cwd", default=None, help="Working directory for game process")
     parser.add_argument("--port", type=int, default=10000, help="Base port for game connections")
     parser.add_argument("--num-envs", type=int, default=4, help="Number of parallel environments")
+    parser.add_argument("--microbatches", type=int, default=1,
+                        help="Split envs into N microbatches to overlap GPU inference with env stepping")
     parser.add_argument("--max-steps", type=int, default=500, help="Truncate episodes after N steps (0 = no limit)")
 
     # Model
@@ -302,7 +436,8 @@ def main():
     parser.add_argument("--eps-end", type=float, default=0.0, help="Final exploration rate for epsilon-greedy")
 
     # Checkpointing and logging
-    parser.add_argument("--checkpoint", default=None, help="Path to model checkpoint to load")
+    parser.add_argument("--checkpoint", default=None, help="Path to model-only checkpoint to load (weights only)")
+    parser.add_argument("--resume", default=None, help="Path to full training checkpoint to resume from")
     parser.add_argument("--save-dir", default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--save-interval", type=int, default=50, help="Save checkpoint every N iterations")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
@@ -319,6 +454,12 @@ def main():
                         help="Show tqdm progress bars during training")
     parser.add_argument("--fp8", action="store_true",
                         help="Enable FP8 mixed precision training (requires Ada/Hopper GPU)")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Enable BF16 mixed precision training")
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile to optimize the model")
+    parser.add_argument("--sync-envs", action="store_true",
+                        help="Use SyncVectorEnv instead of AsyncVectorEnv (for debugging)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -329,6 +470,10 @@ def main():
 
     if not args.playtest and args.test_map is None:
         parser.error("--test-map is required for training mode")
+    if args.fp8 and args.bf16:
+        parser.error("--fp8 and --bf16 are mutually exclusive")
+    if args.checkpoint and args.resume:
+        parser.error("--checkpoint and --resume are mutually exclusive")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -345,7 +490,12 @@ def main():
 
     if args.checkpoint:
         model.load_state_dict(torch.load(args.checkpoint, map_location=device, weights_only=True))
-        logger.info(f"Loaded checkpoint: {args.checkpoint}")
+        logger.info(f"Loaded model weights: {args.checkpoint}")
+
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        logger.info(f"Loaded model from resume checkpoint: {args.resume}")
 
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model created: {n_params:,} parameters")
@@ -371,6 +521,19 @@ def main():
             if isinstance(m, (nn.Linear,)) or type(m).__name__ == "Float8Linear"
         )
         logger.info(f"FP8 training enabled: {converted}/{total_linear} linear layers converted")
+
+    amp_dtype = None
+    if args.bf16:
+        amp_dtype = torch.bfloat16
+        logger.info("BF16 mixed precision enabled")
+
+    # Keep reference to unwrapped model for checkpoint save/load
+    # (torch.compile adds _orig_mod. prefix to state dict keys)
+    raw_model = model
+
+    if args.compile:
+        model = torch.compile(model)
+        logger.info("Model compiled with torch.compile")
 
     # ---- Playtest mode ----
     if args.playtest:
@@ -405,17 +568,30 @@ def main():
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    envs = gym.vector.AsyncVectorEnv([
-        lambda i=i: make_vcmi_env(
-            i,
-            vcmi_client=args.vcmi_client,
-            test_map=args.test_map,
-            port_base=args.port,
-            vcmi_cwd=args.vcmi_cwd,
-            max_steps=args.max_steps,
-        )
-        for i in range(args.num_envs)
-    ])
+    num_mb = args.microbatches
+    if args.num_envs % num_mb != 0:
+        parser.error(f"--num-envs ({args.num_envs}) must be divisible by --microbatches ({num_mb})")
+    envs_per_mb = args.num_envs // num_mb
+
+    vec_env_cls = gym.vector.SyncVectorEnv if args.sync_envs else gym.vector.AsyncVectorEnv
+    if args.sync_envs:
+        logger.info("Using SyncVectorEnv (debug mode)")
+
+    env_groups: list[gym.vector.VectorEnv] = []
+    for mb in range(num_mb):
+        start = mb * envs_per_mb
+        group = vec_env_cls([
+            lambda i=i: make_vcmi_env(
+                i,
+                vcmi_client=args.vcmi_client,
+                test_map=args.test_map,
+                port_base=args.port,
+                vcmi_cwd=args.vcmi_cwd,
+                max_steps=args.max_steps,
+            )
+            for i in range(start, start + envs_per_mb)
+        ])
+        env_groups.append(group)
 
     buffer = RolloutBuffer(args.num_steps, args.num_envs, device)
     trainer = PPOTrainer(
@@ -430,12 +606,24 @@ def main():
         update_epochs=args.update_epochs,
         batch_size=args.batch_size,
         target_kl=args.target_kl,
+        amp_dtype=amp_dtype,
     )
+
+    # Restore optimizer state and counters when resuming
+    start_iteration = 1
+    global_step = 0
+    if args.resume:
+        trainer.optimizer.load_state_dict(ckpt["optimizer"])
+        start_iteration = ckpt["iteration"] + 1
+        global_step = ckpt.get("global_step", 0)
+        logger.info(f"Resumed training from iteration {ckpt['iteration']}, global_step={global_step}")
+        del ckpt  # free memory
 
     logger.info(
         f"PPO training: {args.num_envs} envs × {args.num_steps} steps/iter "
         f"= {args.num_envs * args.num_steps} samples/iter, "
-        f"{args.iterations} iterations"
+        f"iterations {start_iteration}..{args.iterations}"
+        + (f", {num_mb} microbatches" if num_mb > 1 else "")
     )
 
     # Progress bars (optional)
@@ -447,10 +635,10 @@ def main():
         except ImportError:
             logger.warning("tqdm not installed, disabling progress bars")
 
-    global_step = 0
-    obs, _ = envs.reset()
+    iteration = start_iteration - 1  # track last completed iteration for final checkpoint
+    obs_groups = [g.reset()[0] for g in env_groups]
     try:
-        iter_range = range(1, args.iterations + 1)
+        iter_range = range(start_iteration, args.iterations + 1)
         if tqdm_cls is not None:
             iter_bar = tqdm_cls(iter_range, desc="Training", unit="iter")
         else:
@@ -471,9 +659,9 @@ def main():
                     total=args.num_steps, desc="  Rollout", unit="step",
                     leave=False,
                 )
-            rollout_stats, obs = collect_rollout(
-                envs, model, buffer, device, obs,
-                step_bar=step_bar, epsilon=epsilon,
+            rollout_stats, obs_groups = collect_rollout(
+                env_groups, model, buffer, device, obs_groups,
+                step_bar=step_bar, epsilon=epsilon, amp_dtype=amp_dtype,
             )
             if step_bar is not None:
                 step_bar.close()
@@ -490,7 +678,6 @@ def main():
             if tqdm_cls is not None and hasattr(iter_bar, "set_postfix"):
                 iter_bar.set_postfix(
                     reward=f"{rollout_stats['mean_reward']:.3f}",
-                    illegal=f"{rollout_stats['illegal_rate']:.0%}",
                     eps=f"{epsilon:.2f}",
                     sps=f"{sps:.0f}",
                 )
@@ -503,7 +690,6 @@ def main():
                 f"[{rollout_stats['min_reward']:.1f}, {rollout_stats['max_reward']:.1f}], "
                 f"killed={rollout_stats['mean_enemy_killed']:.3f}, "
                 f"lost={rollout_stats['mean_own_lost']:.3f}, "
-                f"illegal={rollout_stats['illegal_rate']:.1%}, "
                 f"pg_loss={ppo_metrics['policy_loss']:.4f}, "
                 f"v_loss={ppo_metrics['value_loss']:.4f}, "
                 f"entropy={ppo_metrics['entropy']:.3f}, "
@@ -519,10 +705,8 @@ def main():
                     "rollout/mean_reward": rollout_stats["mean_reward"],
                     "rollout/min_reward": rollout_stats["min_reward"],
                     "rollout/max_reward": rollout_stats["max_reward"],
-                    "rollout/illegal_rate": rollout_stats["illegal_rate"],
                     "rollout/mean_enemy_killed": rollout_stats["mean_enemy_killed"],
                     "rollout/mean_own_lost": rollout_stats["mean_own_lost"],
-                    "rollout/illegal_actions": rollout_stats["illegal_actions"],
                     "ppo/policy_loss": ppo_metrics["policy_loss"],
                     "ppo/value_loss": ppo_metrics["value_loss"],
                     "ppo/entropy": ppo_metrics["entropy"],
@@ -537,17 +721,28 @@ def main():
 
             # Save checkpoint
             if iteration % args.save_interval == 0:
-                ckpt_path = save_dir / f"model_iter{iteration}.pt"
-                torch.save(model.state_dict(), ckpt_path)
+                ckpt_path = save_dir / f"checkpoint_iter{iteration}.pt"
+                torch.save({
+                    "model": raw_model.state_dict(),
+                    "optimizer": trainer.optimizer.state_dict(),
+                    "iteration": iteration,
+                    "global_step": global_step,
+                }, ckpt_path)
                 logger.info(f"Saved checkpoint: {ckpt_path}")
 
     except KeyboardInterrupt:
         logger.info("Training interrupted by user.")
     finally:
-        envs.close()
+        for g in env_groups:
+            g.close()
         # Save final checkpoint
-        ckpt_path = save_dir / "model_latest.pt"
-        torch.save(model.state_dict(), ckpt_path)
+        ckpt_path = save_dir / "checkpoint_latest.pt"
+        torch.save({
+            "model": raw_model.state_dict(),
+            "optimizer": trainer.optimizer.state_dict(),
+            "iteration": iteration,
+            "global_step": global_step,
+        }, ckpt_path)
         logger.info(f"Saved final checkpoint: {ckpt_path}")
 
         if wandb_run is not None:

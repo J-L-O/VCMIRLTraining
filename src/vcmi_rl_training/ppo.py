@@ -16,6 +16,7 @@ from vcmigym import (
     BATTLEFIELD_HEXES,
     STACK_FEATURES,
     OBSTACLE_FEATURES,
+    NUM_ACTION_TYPES,
 )
 
 
@@ -35,6 +36,11 @@ class RolloutBuffer:
         self.obs_reachable = np.zeros((num_steps, num_envs, BATTLEFIELD_HEXES), dtype=np.float32)
         self.obs_n_stacks = np.zeros((num_steps, num_envs, 1), dtype=np.int32)
         self.obs_attack_targets = np.zeros((num_steps, num_envs, MAX_ATTACK_TARGETS, 2), dtype=np.int32)
+
+        # Action masks
+        self.mask_action_type = np.zeros((num_steps, num_envs, NUM_ACTION_TYPES), dtype=np.bool_)
+        self.mask_hex = np.zeros((num_steps, num_envs, BATTLEFIELD_HEXES), dtype=np.bool_)
+        self.mask_target = np.zeros((num_steps, num_envs, MAX_STACKS), dtype=np.bool_)
 
         # Actions and policy outputs
         self.actions = np.zeros((num_steps, num_envs, 3), dtype=np.int64)
@@ -61,6 +67,9 @@ class RolloutBuffer:
         self.obs_reachable[t] = obs["reachable_hexes"]
         self.obs_n_stacks[t] = obs["n_stacks"]
         self.obs_attack_targets[t] = obs["attack_targets"]
+        self.mask_action_type[t] = obs["action_type_mask"]
+        self.mask_hex[t] = obs["hex_mask"]
+        self.mask_target[t] = obs["target_mask"]
         self.actions[t] = actions
         self.log_probs[t] = log_probs
         self.values[t] = values
@@ -146,6 +155,15 @@ class RolloutBuffer:
             "attack_targets": torch.from_numpy(self.obs_attack_targets.reshape(S * E, MAX_ATTACK_TARGETS, 2)).to(self.device),
         }
 
+    def flatten_action_masks(self) -> dict[str, torch.Tensor]:
+        """Flatten action masks (steps, envs, ...) → (steps*envs, ...) as tensors."""
+        S, E = self.num_steps, self.num_envs
+        return {
+            "action_type": torch.from_numpy(self.mask_action_type.reshape(S * E, NUM_ACTION_TYPES)).to(self.device),
+            "hex": torch.from_numpy(self.mask_hex.reshape(S * E, BATTLEFIELD_HEXES)).to(self.device),
+            "target": torch.from_numpy(self.mask_target.reshape(S * E, MAX_STACKS)).to(self.device),
+        }
+
     def flatten_actions(self) -> torch.Tensor:
         S, E = self.num_steps, self.num_envs
         return torch.from_numpy(self.actions.reshape(S * E, 3)).long().to(self.device)
@@ -180,6 +198,7 @@ class PPOTrainer:
         update_epochs: int = 4,
         batch_size: int = 256,
         target_kl: float | None = None,
+        amp_dtype: torch.dtype | None = None,
     ):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
@@ -192,11 +211,13 @@ class PPOTrainer:
         self.update_epochs = update_epochs
         self.batch_size = batch_size
         self.target_kl = target_kl
+        self.amp_dtype = amp_dtype
 
     def update(self, buffer: RolloutBuffer) -> dict[str, float]:
         """Run PPO update on collected rollout data. Returns loss metrics."""
         all_obs = buffer.flatten_obs()
         all_actions = buffer.flatten_actions()
+        all_action_masks = buffer.flatten_action_masks()
         all_old_log_probs = buffer.flatten_log_probs()
         all_advantages = buffer.flatten_advantages()
         all_returns = buffer.flatten_returns()
@@ -226,32 +247,34 @@ class PPOTrainer:
                 # Slice batch observations
                 batch_obs = {k: v[batch_idx_t] for k, v in all_obs.items()}
                 batch_actions = all_actions[batch_idx_t]
+                batch_masks = {k: v[batch_idx_t] for k, v in all_action_masks.items()}
                 batch_old_log_probs = all_old_log_probs[batch_idx_t]
                 batch_advantages = all_advantages[batch_idx_t]
                 batch_returns = all_returns[batch_idx_t]
 
                 # Evaluate actions under current policy
-                _, new_log_probs, entropy, new_values = self.model.get_action_and_value(
-                    batch_obs, action=batch_actions
-                )
+                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.amp_dtype is not None):
+                    _, new_log_probs, entropy, new_values = self.model.get_action_and_value(
+                        batch_obs, action=batch_actions, action_mask=batch_masks
+                    )
 
-                # Policy loss (clipped surrogate)
-                log_ratio = new_log_probs - batch_old_log_probs
-                ratio = log_ratio.exp()
-                pg_loss1 = -batch_advantages * ratio
-                pg_loss2 = -batch_advantages * torch.clamp(
-                    ratio, 1 - self.clip_eps, 1 + self.clip_eps
-                )
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    # Policy loss (clipped surrogate)
+                    log_ratio = new_log_probs - batch_old_log_probs
+                    ratio = log_ratio.exp()
+                    pg_loss1 = -batch_advantages * ratio
+                    pg_loss2 = -batch_advantages * torch.clamp(
+                        ratio, 1 - self.clip_eps, 1 + self.clip_eps
+                    )
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss (MSE)
-                v_loss = 0.5 * ((new_values - batch_returns) ** 2).mean()
+                    # Value loss (MSE)
+                    v_loss = 0.5 * ((new_values - batch_returns) ** 2).mean()
 
-                # Entropy bonus
-                entropy_loss = entropy.mean()
+                    # Entropy bonus
+                    entropy_loss = entropy.mean()
 
-                # Total loss
-                loss = pg_loss + self.value_coef * v_loss - self.entropy_coef * entropy_loss
+                    # Total loss
+                    loss = pg_loss + self.value_coef * v_loss - self.entropy_coef * entropy_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()

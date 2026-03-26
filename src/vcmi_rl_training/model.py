@@ -73,7 +73,7 @@ HEX_CONTINUOUS_DIM = 29
 HERO_CONTINUOUS_DIM = 5   # has_hero, mana_norm, spells_norm, enchanter_norm, side
 
 # Global features broadcast to all tokens
-GLOBAL_DIM = 5            # round_norm, terrain, battlefield, is_siege, active_side
+GLOBAL_DIM = 4            # terrain, battlefield, is_siege, active_side
 
 
 class BattleTransformer(nn.Module):
@@ -366,7 +366,6 @@ class BattleTransformer(nn.Module):
     def _extract_global_features(self, scalars: Tensor) -> Tensor:
         """Extract global battle features from scalars."""
         return torch.stack([
-            scalars[:, _SC["ROUND"]] / 50.0,
             scalars[:, _SC["TERRAIN"]] / 10.0,
             scalars[:, _SC["BATTLEFIELD"]] / 10.0,
             scalars[:, _SC["IS_SIEGE"]],
